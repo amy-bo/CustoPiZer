@@ -1,0 +1,127 @@
+name: "Test image"
+
+# Fork-only. Builds ONE Leader + Worker image from a branch of this fork and
+# publishes it as a GitHub release, plus a Raspberry Pi Imager repository file
+# at data_repository/os_list_test.json on the default branch, so the branch can
+# be flashed exactly as a released Pioreactor image would be:
+#   Imager > App Options > Content Repository > Use Custom URL >
+#   https://raw.githubusercontent.com/amy-bo/CustoPiZer/pioreactor/data_repository/os_list_test.json
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch of this fork to build"
+        required: true
+        default: "bootfs-plugins"
+      pioreactor_version:
+        description: "Pioreactor release to install"
+        required: true
+        default: "26.10.0"
+
+jobs:
+  build:
+    name: "Build Leader + Worker"
+    runs-on: ubuntu-latest
+    steps:
+    - name: "⬇ Checkout branch under test"
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+
+    - name: "⬇ Checkout Pioreactor assets"
+      uses: actions/checkout@v4
+      with:
+        repository: Pioreactor/pioreactor
+        ref: ${{ inputs.pioreactor_version }}
+        path: pioreactor-source
+
+    - name: "🔁 Sync Pioreactor assets"
+      run: bash scripts/sync_pioreactor_assets.sh "${{ github.workspace }}/pioreactor-source"
+
+    - name: "⬇ Download Python wheels"
+      run: bash scripts/download_python_wheels.sh
+
+    - name: "⬇ Download RPi image"
+      run: |
+        mkdir -p build
+        cd build
+        wget https://downloads.raspberrypi.com/raspios_lite_armhf/images/raspios_lite_armhf-2026-04-21/2026-04-21-raspios-trixie-armhf-lite.img.xz -q -O input.img.xz
+        unxz -f input.img.xz
+
+    - name: "🏗 Run CustoPiZer LW"
+      uses: Pioreactor/CustoPiZer@pioreactor
+      with:
+        workspace: "${{ github.workspace }}/build"
+        scripts:  "${{ github.workspace }}/workspace/scripts"
+        config: "${{ github.workspace }}/config.local"
+        environment: '{ "PIO_VERSION": "${{ inputs.pioreactor_version }}", "LEADER": 1, "WORKER": 1, "HEADLESS": 1, "CUSTOPIZER_GIT_COMMIT": "${{ github.sha }}"}'
+        custopizer: "1.5.0"
+
+    - name: "✏ Rename image"
+      run: mv build/output.img build/pioreactor_leader_worker.img
+
+    - name: "📦 Package the image"
+      id: package
+      uses: OctoPrint/actions/package-rpi-image@main
+      with:
+        image_path: "build/pioreactor_leader_worker.img"
+
+    - name: "🔖 Release"
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="test-${{ inputs.ref }}-${{ github.run_number }}"
+        echo "TAG=$TAG" >> "$GITHUB_ENV"
+        gh release create "$TAG" \
+          --title "Test image: ${{ inputs.ref }} on Pioreactor ${{ inputs.pioreactor_version }} (#${{ github.run_number }})" \
+          --notes "Leader + Worker image built from branch \`${{ inputs.ref }}\` at ${{ github.sha }} with Pioreactor ${{ inputs.pioreactor_version }}. For testing only." \
+          "build/${{ steps.package.outputs.zip_name }}" \
+          build/pioreactor_leader_worker.img.md5 \
+          build/pioreactor_leader_worker.img.sha256
+
+    - name: "⬇ Checkout default branch for the Imager list"
+      uses: actions/checkout@v4
+      with:
+        ref: pioreactor
+        path: meta
+
+    - name: "🗂 Write and push the Imager repository file"
+      env:
+        ZIP_NAME: ${{ steps.package.outputs.zip_name }}
+        ZIP_SIZE: ${{ steps.package.outputs.zip_size }}
+        IMAGE_SIZE: ${{ steps.package.outputs.image_size }}
+        IMAGE_SHA256: ${{ steps.package.outputs.image_sha256 }}
+        REF: ${{ inputs.ref }}
+        PIO_VERSION: ${{ inputs.pioreactor_version }}
+      run: |
+        python3 - <<'PY'
+        import json, os, datetime
+        from pathlib import Path
+        ref = json.loads(Path("data_repository/os_list_pioreactor.json").read_text())
+        tag = os.environ["TAG"]
+        entry = {
+            "name": f"Pioreactor Leader + Worker (test: {os.environ['REF']})",
+            "description": f"Pioreactor {os.environ['PIO_VERSION']} built from amy-bo/CustoPiZer branch {os.environ['REF']}. Testing only.",
+            "icon": "https://cdn.shopify.com/s/files/1/0678/1739/files/pioreactor_square_logo.png?v=1674681948",
+            "url": f"https://github.com/amy-bo/CustoPiZer/releases/download/{tag}/{os.environ['ZIP_NAME']}",
+            "image_download_size": int(os.environ["ZIP_SIZE"]),
+            "release_date": datetime.date.today().isoformat(),
+            "init_format": "systemd",
+            "devices": ["pi5-32bit", "pi4-32bit", "pi3-32bit", "pi2-32bit"],
+            "extract_size": int(os.environ["IMAGE_SIZE"]),
+            "extract_sha256": os.environ["IMAGE_SHA256"],
+        }
+        out = {"imager": ref["imager"], "os_list": [entry]}
+        Path("meta/data_repository/os_list_test.json").write_text(json.dumps(out, indent=2) + "\n")
+        PY
+        cd meta
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add data_repository/os_list_test.json
+        git commit -m "Test image ${TAG}: update Imager repository file"
+        git push
+        echo "Imager URL: https://raw.githubusercontent.com/amy-bo/CustoPiZer/pioreactor/data_repository/os_list_test.json" >> "$GITHUB_STEP_SUMMARY"
